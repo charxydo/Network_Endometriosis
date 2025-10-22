@@ -1,0 +1,327 @@
+---
+title: "Main Script"
+author: '"charxydo"'
+date: "2025-10-08"
+output: html_document
+---
+
+```{r}
+setwd("C:/Users/harax/OneDrive/Υπολογιστής/Net.Bio2/Endometriosis_Project/DATA")
+```
+
+
+```{r}
+install.packages(c("Seurat", "tidyverse"))
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+
+remotes::install_github("mojaveazure/seurat-disk")
+
+install.packages('devtools')
+devtools::install_github('immunogenomics/presto')
+
+BiocManager::install("STRINGdb")
+
+library(biomaRt)
+library(clusterProfiler)
+library(dplyr)
+library(forcats)
+library(ggplot2)
+library(igraph)
+library(org.Hs.eg.db)
+library(RCy3)
+library(Seurat)
+library(SeuratDisk)
+library(STRINGdb)
+library(tidyr)
+library(tidyverse)
+```
+
+```{r}
+# Load expression data and metadata from csv
+expr <- read.csv("stromal_expression.csv", row.names = 1)
+meta <- read.csv("stromal_metadata.csv", row.names = 1)
+expr_t <- t(expr)
+
+# Create the Seurat object 
+stromal <- CreateSeuratObject(counts = expr_t, meta.data = meta)
+```
+
+```{r}
+# Inspection
+colnames(stromal@meta.data)
+table(stromal@meta.data$sample_type_rename)   # # cells per lesion type (raw)
+table(stromal@meta.data$PID)                  # cells per patient
+```
+
+```{r}
+# Compute per-sample counts and percentages
+comp_sample <- meta %>%
+  count(PID, sample_type = sample_type_rename, celltype) %>% 
+  group_by(PID, sample_type) %>%
+  mutate(total_cells = sum(n),
+         pct = n / total_cells * 100) %>%
+  ungroup()
+# Stacked barplot: each sample (x), stacked by celltype; samples grouped by lesion type
+# Order samples by lesion type then total cells and PID
+comp_sample <- comp_sample %>%
+  mutate(PID = factor(PID, levels = unique(PID[order(sample_type)])),
+         celltype = fct_rev(factor(celltype))) 
+
+ggplot(comp_sample, aes(x = PID, y = pct, fill = celltype)) +
+  geom_col(width = 0.8) +
+  facet_grid(~ sample_type, scales = "free_x", space = "free_x") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = "grey95")) +
+  labs(x = "Sample (PID) grouped by lesion type", y = "Percent of cells (%)",
+       title = "Cell-type composition per sample (stacked by cell type)") +
+  guides(fill = guide_legend(ncol = 1))
+```
+
+```{r}
+# Summary: boxplots of % per celltype across lesion/sample_type
+# Compute per-sample % per celltype already in comp_sample
+ggplot(comp_sample, aes(x = celltype, y = pct, fill = sample_type)) +
+  geom_boxplot(position = position_dodge(width = 0.9), outlier.shape = NA) +
+  geom_jitter(aes(color = sample_type), width = 0.2, size = 0.8, alpha = 0.7) +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Cell type", y = "Percent of cells per sample (%)",
+       title = "Distribution of cell-type percentages across lesion types")
+```
+
+```{r}
+# Statistical test per celltype: Kruskal-Wallis across lesion types (non-parametric)
+kw_results <- comp_sample %>%
+  group_by(celltype) %>%
+  summarise(
+    kruskal_p = if (n_distinct(sample_type) > 1) {
+      kruskal.test(pct ~ sample_type, data = cur_data_all())$p.value
+    } else NA_real_
+  ) %>%
+  arrange(kruskal_p)
+
+print(kw_results)
+
+```
+Single-cell DE: mural cells in peritoneum lesions (EcP)
+```{r}
+# Since we downloaded the normalized data no normalization should be applied on the counts and counts == data
+stromal_copy <- stromal
+counts_mat <- LayerData(stromal, layer = "counts")
+LayerData(stromal, layer = "data") <- counts_mat
+
+
+# Subset only peritoneum lesions (EcP)
+EcP <- subset(
+  stromal,
+  subset = sample_type_rename == "EcP"
+)
+
+# Set the cell identity to the cell type annotation
+Idents(EcP) <- EcP$celltype
+
+# Run DE: mural vs fibroblasts within EcP
+mural_markers <- FindMarkers(
+  object   = EcP,
+  ident.1  = "mural cells",        
+  ident.2  = c("fibroblast 1", "fibroblast 3"),  
+  test.use = "wilcox"
+)
+
+print(mural_markers)
+```
+
+Get the significant DEGs
+```{r}
+# Subset for significant DEGs
+mural_markers_filtered <- mural_markers[
+  mural_markers$p_val_adj < 0.05 &
+  abs(mural_markers$avg_log2FC) > 0.25,
+]
+
+mural_markers_strict <- mural_markers[
+  mural_markers$p_val_adj < 0.01 &
+  abs(mural_markers$avg_log2FC) > 0.5,
+]
+```
+
+Build the PPI network of the mural marker genes 
+```{r}
+# Initialize STRINGdb
+# The data where manually downloaded from the STRING database and saved locally. The files downloaded were the protein.info protein.aliances and protein.links for homo sapiens with high confidence 700 score.
+string_db1 <- STRINGdb$new(
+  version = "12.0",
+  species = 9606,
+  score_threshold = 700,
+  input_directory = "C:\\Users\\harax\\OneDrive\\Υπολογιστής\\Net.Bio2\\Endometriosis_Project\\DATA\\string_data"
+)
+# Map the mural DE genes to STRING IDs
+mural_markers_strict_wth_genes <- mural_markers_strict %>% mutate(gene = rownames(mural_markers_strict))
+
+# Retrieve all PPIs for mapped genes
+mapped_de_mural_genes <- string_db1$map(data.frame(mural_markers_strict_wth_genes), 
+                              "gene", removeUnmappedRows=TRUE)
+
+ppi_mural_markers <- string_db1$get_interactions(mapped_de_mural_genes$STRING_id)
+
+# Build igraph object from filtered edges
+edges_mural <- ppi_mural_markers[, c("from", "to")]
+g_mural <- graph_from_data_frame(edges_mural, directed = FALSE)
+```
+
+Run community clustering with Leiden 
+```{r}
+# Identify communities 
+set.seed(123)
+comm_mural <- cluster_leiden(g_mural, resolution = 0.2)
+V(g_mural)$community <- membership(comm_mural)
+
+cat("Detected communities:", length(unique(membership(comm_mural))), "\n")
+print(sizes(comm_mural))
+
+# Filter very small communities 
+# community membership
+mem_mural <- V(g_mural)$community
+comm_mural_sizes <- table(mem_mural)
+keep_comms_mural <- names(comm_mural_sizes[comm_mural_sizes >= 3])  # keep communities size >= 3
+```
+
+Calculate TF density per community 
+```{r}
+# Insert homo sapiens list of TFs from AnimalTFDB
+TF_list <- read.delim("C:\\Users\\harax\\OneDrive\\Υπολογιστής\\Net.Bio2\\Endometriosis_Project\\DATA\\Homo_sapiens_TF.txt", stringsAsFactors = FALSE)$Ensembl
+
+# Remove homo sapiens prefix from gene name 
+V(g_mural)$name <- sub("^9606\\.", "", V(g_mural)$name)
+
+# Connect to Ensembl
+mart <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get ENSP ids 
+ensp_ids <- unique(V(g_mural)$name)
+
+# Map ENSP to ENSG and gene symbol
+mapping_ensg <- getBM(
+  attributes = c("ensembl_peptide_id", "ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_peptide_id",
+  values = ensp_ids,
+  mart = mart
+)
+# Create lookup
+ens_lookup <- setNames(mapping_ensg$ensembl_gene_id, mapping_ensg$ensembl_peptide_id)
+
+symbol_lookup <- setNames(mapping_ensg$hgnc_symbol,
+                          mapping_ensg$ensembl_peptide_id)
+# Add ENSG as new attribute
+V(g_mural)$ensg <- ens_lookup[V(g_mural)$name]
+V(g_mural)$symbol <- symbol_lookup[V(g_mural)$name]
+
+# Match TF genes to the mural marker genes
+V(g_mural)$is_TF <- V(g_mural)$ensg %in% TF_list
+sum(V(g_mural)$is_TF)
+
+# Build a dataframe of node->community
+node_df_mural <- data.frame(ensp = V(g_mural)$name,
+                            ensg = V(g_mural)$ensg,
+                            community = as.character(mem_mural), 
+                            is_TF = V(g_mural)$is_TF,
+                            stringsAsFactors=FALSE)
+
+# Filter to include only nodes in communities >3 
+node_df_mural_filtered <- subset(node_df_mural, community %in% keep_comms_mural)
+
+# Compute TF density per community
+tf_summary_mural <- node_df_mural_filtered %>%
+  group_by(community) %>%
+  summarise(
+    n_genes = n(),
+    n_TF = sum(is_TF),
+    TF_density = n_TF / n_genes
+  ) %>%
+  arrange(desc(TF_density), desc(n_genes))
+
+tf_summary_mural
+```
+
+TF enrichment in communities with size >= 3
+```{r}
+num_with_TF_mural <- sum(tf_summary_mural$TF_density > 0)
+total_comms_filtered <- nrow(tf_summary_mural)
+percent_with_TF_mural <- (num_with_TF_mural / total_comms_filtered) * 100
+percent_with_TF_mural
+
+```
+```{r}
+selected_comms <- c(9, 11, 15, 28, 43, 45, 68) 
+
+V(g_mural)$log2FC <- mural_markers_strict_wth_genes$avg_log2FC[
+  match(V(g_mural)$symbol, mural_markers_strict_wth_genes$gene)
+]
+
+V(g_mural)$padj <- mural_markers_strict_wth_genes$p_val_adj[
+  match(V(g_mural)$symbol, mural_markers_strict_wth_genes$gene)
+]
+
+for (comm in selected_comms) {
+  nodes_comm <- V(g_mural)[V(g_mural)$community == comm]
+  
+  sub_g <- induced_subgraph(g_mural, vids = nodes_comm)
+  
+  createNetworkFromIgraph(
+    sub_g,
+    title = paste0("Community_", comm),
+    collection = "Selected_Mural_Communities"
+  )
+}
+```
+
+```{r}
+# Create a node data frame of all the communities 
+node_df <- data.frame(
+  gene      = V(g_mural)$symbol,
+  log2FC    = V(g_mural)$log2FC,
+  p_val_adj = V(g_mural)$padj,
+  community = V(g_mural)$community,
+  stringsAsFactors = FALSE
+)
+```
+
+ORA for the selected communities 
+```{r}
+background_genes <- unique(mural_markers_strict_wth_genes$gene) 
+
+enrichGO_results <- list()
+
+for (comm in selected_comms) {
+  
+  
+  genes_comm <- V(g_mural)$symbol[V(g_mural)$community == comm]
+  genes_comm <- genes_comm[!is.na(genes_comm) & genes_comm != ""]
+  
+    enrich_res <- enrichGO(
+    gene          = genes_comm,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.2,
+    universe      = background_genes
+  )
+  
+  enrichGO_results[[paste0("Community_", comm)]] <- enrich_res
+}
+```
+
+```{r}
+for (comm in names(enrichGO_results)) {
+  res <- enrichGO_results[[comm]]
+  if (nrow(as.data.frame(res)) > 0) {
+    print(dotplot(res) + ggtitle(comm))
+  }
+}
+```
+
